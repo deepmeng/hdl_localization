@@ -2,17 +2,23 @@
 #define POSE_ESTIMATOR_HPP
 
 #include <memory>
+#include <boost/optional.hpp>
+
 #include <ros/ros.h>
 #include <pcl/point_types.h>
 #include <pcl/point_cloud.h>
+#include <pcl/registration/registration.h>
 
-#include <pclomp/ndt_omp.h>
-#include <pcl/filters/voxel_grid.h>
-
-#include <hdl_localization/pose_system.hpp>
-#include <kkl/alg/unscented_kalman_filter.hpp>
+namespace kkl {
+  namespace alg {
+template<typename T, class System> class UnscentedKalmanFilterX;
+  }
+}
 
 namespace hdl_localization {
+
+class PoseSystem;
+class OdomSystem;
 
 /**
  * @brief scan matching-based pose estimator
@@ -29,34 +35,14 @@ public:
    * @param quat                initial orientation
    * @param cool_time_duration  during "cool time", prediction is not performed
    */
-  PoseEstimator(pcl::Registration<PointT, PointT>::Ptr& registration, const ros::Time& stamp, const Eigen::Vector3f& pos, const Eigen::Quaternionf& quat, double cool_time_duration = 1.0)
-    : init_stamp(stamp),
-      registration(registration),
-      cool_time_duration(cool_time_duration)
-  {
-    process_noise = Eigen::MatrixXf::Identity(16, 16);
-    process_noise.middleRows(0, 3) *= 1.0;
-    process_noise.middleRows(3, 3) *= 1.0;
-    process_noise.middleRows(6, 4) *= 0.5;
-    process_noise.middleRows(10, 3) *= 1e-6;
-    process_noise.middleRows(13, 3) *= 1e-6;
+  PoseEstimator(pcl::Registration<PointT, PointT>::Ptr& registration, const ros::Time& stamp, const Eigen::Vector3f& pos, const Eigen::Quaternionf& quat, double cool_time_duration = 1.0);
+  ~PoseEstimator();
 
-    Eigen::MatrixXf measurement_noise = Eigen::MatrixXf::Identity(7, 7);
-    measurement_noise.middleRows(0, 3) *= 0.01;
-    measurement_noise.middleRows(3, 4) *= 0.001;
-
-    Eigen::VectorXf mean(16);
-    mean.middleRows(0, 3) = pos;
-    mean.middleRows(3, 3).setZero();
-    mean.middleRows(6, 4) = Eigen::Vector4f(quat.w(), quat.x(), quat.y(), quat.z());
-    mean.middleRows(10, 3).setZero();
-    mean.middleRows(13, 3).setZero();
-
-    Eigen::MatrixXf cov = Eigen::MatrixXf::Identity(16, 16) * 0.01;
-
-    PoseSystem system;
-    ukf.reset(new kkl::alg::UnscentedKalmanFilterX<float, PoseSystem>(system, 16, 6, 7, process_noise, measurement_noise, mean, cov));
-  }
+  /**
+   * @brief predict
+   * @param stamp    timestamp
+   */
+  void predict(const ros::Time& stamp);
 
   /**
    * @brief predict
@@ -64,86 +50,54 @@ public:
    * @param acc      acceleration
    * @param gyro     angular velocity
    */
-  void predict(const ros::Time& stamp, const Eigen::Vector3f& acc, const Eigen::Vector3f& gyro) {
-    if((stamp - init_stamp).toSec() < cool_time_duration || prev_stamp.is_zero() || prev_stamp == stamp) {
-      prev_stamp = stamp;
-      return;
-    }
+  void predict(const ros::Time& stamp, const Eigen::Vector3f& acc, const Eigen::Vector3f& gyro);
 
-    double dt = (stamp - prev_stamp).toSec();
-    prev_stamp = stamp;
-
-    ukf->setProcessNoiseCov(process_noise * dt);
-    ukf->system.dt = dt;
-
-    Eigen::VectorXf control(6);
-    control.head<3>() = acc;
-    control.tail<3>() = gyro;
-
-    ukf->predict(control);
-  }
+  /**
+   * @brief update the state of the odomety-based pose estimation
+   */
+  void predict_odom(const Eigen::Matrix4f& odom_delta);
 
   /**
    * @brief correct
    * @param cloud   input cloud
    * @return cloud aligned to the globalmap
    */
-  pcl::PointCloud<PointT>::Ptr correct(const pcl::PointCloud<PointT>::ConstPtr& cloud) {
-    Eigen::Matrix4f init_guess = Eigen::Matrix4f::Identity();
-    init_guess.block<3, 3>(0, 0) = quat().toRotationMatrix();
-    init_guess.block<3, 1>(0, 3) = pos();
-
-    pcl::PointCloud<PointT>::Ptr aligned(new pcl::PointCloud<PointT>());
-    registration->setInputSource(cloud);
-    registration->align(*aligned, init_guess);
-
-    Eigen::Matrix4f trans = registration->getFinalTransformation();
-    Eigen::Vector3f p = trans.block<3, 1>(0, 3);
-    Eigen::Quaternionf q(trans.block<3, 3>(0, 0));
-
-    if(quat().coeffs().dot(q.coeffs()) < 0.0f) {
-      q.coeffs() *= -1.0f;
-    }
-
-    Eigen::VectorXf observation(7);
-    observation.middleRows(0, 3) = p;
-    observation.middleRows(3, 4) = Eigen::Vector4f(q.w(), q.x(), q.y(), q.z());
-
-    ukf->correct(observation);
-    return aligned;
-  }
+  pcl::PointCloud<PointT>::Ptr correct(const ros::Time& stamp, const pcl::PointCloud<PointT>::ConstPtr& cloud);
 
   /* getters */
-  Eigen::Vector3f pos() const {
-    return Eigen::Vector3f(ukf->mean[0], ukf->mean[1], ukf->mean[2]);
-  }
+  ros::Time last_correction_time() const;
 
-  Eigen::Vector3f vel() const {
-    return Eigen::Vector3f(ukf->mean[3], ukf->mean[4], ukf->mean[5]);
-  }
+  Eigen::Vector3f pos() const;
+  Eigen::Vector3f vel() const;
+  Eigen::Quaternionf quat() const;
+  Eigen::Matrix4f matrix() const;
 
-  Eigen::Quaternionf quat() const {
-    return Eigen::Quaternionf(ukf->mean[6], ukf->mean[7], ukf->mean[8], ukf->mean[9]).normalized();
-  }
+  Eigen::Vector3f odom_pos() const;
+  Eigen::Quaternionf odom_quat() const;
+  Eigen::Matrix4f odom_matrix() const;
 
-  Eigen::Matrix4f matrix() const {
-    Eigen::Matrix4f m = Eigen::Matrix4f::Identity();
-    m.block<3, 3>(0, 0) = quat().toRotationMatrix();
-    m.block<3, 1>(0, 3) = pos();
-    return m;
-  }
+  const boost::optional<Eigen::Matrix4f>& wo_prediction_error() const;
+  const boost::optional<Eigen::Matrix4f>& imu_prediction_error() const;
+  const boost::optional<Eigen::Matrix4f>& odom_prediction_error() const;
 
 private:
-  ros::Time init_stamp;         // when the estimator was initialized
-  ros::Time prev_stamp;         // when the estimator was updated last time
-  double cool_time_duration;    //
+  ros::Time init_stamp;             // when the estimator was initialized
+  ros::Time prev_stamp;             // when the estimator was updated last time
+  ros::Time last_correction_stamp;  // when the estimator performed the correction step
+  double cool_time_duration;        //
 
   Eigen::MatrixXf process_noise;
   std::unique_ptr<kkl::alg::UnscentedKalmanFilterX<float, PoseSystem>> ukf;
+  std::unique_ptr<kkl::alg::UnscentedKalmanFilterX<float, OdomSystem>> odom_ukf;
+
+  Eigen::Matrix4f last_observation;
+  boost::optional<Eigen::Matrix4f> wo_pred_error;
+  boost::optional<Eigen::Matrix4f> imu_pred_error;
+  boost::optional<Eigen::Matrix4f> odom_pred_error;
 
   pcl::Registration<PointT, PointT>::Ptr registration;
-};
+  };
 
-}
+}  // namespace hdl_localization
 
-#endif // POSE_ESTIMATOR_HPP
+#endif  // POSE_ESTIMATOR_HPP
